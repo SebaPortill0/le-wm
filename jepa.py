@@ -111,9 +111,12 @@ class JEPA(nn.Module):
 
     def criterion(self, info_dict: dict):
         """Compute the cost between predicted embeddings and goal embeddings."""
-        pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
-        goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
+        pred_emb = info_dict["predicted_emb"]  # (B, S, T, dim)
+        goal_emb = info_dict["goal_emb"]  # (B, T, dim)
 
+        # add the sample dim so each env is compared with its own goal
+        if goal_emb.ndim == pred_emb.ndim - 1:
+            goal_emb = goal_emb.unsqueeze(1)
         goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
 
         # return last-step cost per action candidate
@@ -135,19 +138,22 @@ class JEPA(nn.Module):
             if torch.is_tensor(info_dict[k]):
                 info_dict[k] = info_dict[k].to(device)
 
-        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
-        goal["pixels"] = goal["goal"]
+        # encode goal once, then reuse the cached embedding across solver steps
+        if "goal_emb" not in info_dict:
+            goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+            goal["pixels"] = goal["goal"]
 
-        for k in info_dict:
-            if k.startswith("goal_"):
-                goal[k[len("goal_") :]] = goal.pop(k)
+            for k in info_dict:
+                if k.startswith("goal_"):
+                    goal[k[len("goal_") :]] = goal.pop(k)
 
-        goal.pop("action")
-        goal = self.encode(goal)
+            goal.pop("action", None)
+            goal = self.encode(goal)
 
-        info_dict["goal_emb"] = goal["emb"]
+            info_dict["goal_emb"] = goal["emb"]
+
         info_dict = self.rollout(info_dict, action_candidates)
 
         cost = self.criterion(info_dict)
-        
+
         return cost

@@ -26,8 +26,12 @@ def img_transform(cfg):
     return transform
 
 
+def get_episode_col(dataset):
+    return "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+
+
 def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    col_name = get_episode_col(dataset)
 
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data("step_idx")
@@ -65,8 +69,8 @@ def run(cfg: DictConfig):
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
     stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
+    col_name = get_episode_col(dataset)
+    ep_indices = np.unique(stats_dataset.get_col_data(col_name))
 
     process = {}
     for col in cfg.dataset.keys_to_cache:
@@ -82,11 +86,12 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     # -- run evaluation
-    policy = cfg.get("policy", "random")
+    policy_name = cfg.get("policy", "random")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
-        model = model.to("cuda")
+    if policy_name != "random":
+        model = swm.wm.utils.load_pretrained(policy_name)
+        model = model.to(device)
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
@@ -100,8 +105,8 @@ def run(cfg: DictConfig):
         policy = swm.policy.RandomPolicy()
 
     results_path = (
-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
+        Path(swm.data.utils.get_cache_dir(), policy_name).parent
+        if policy_name != "random"
         else Path(__file__).parent
     )
 
@@ -109,8 +114,7 @@ def run(cfg: DictConfig):
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    # Map each dataset row's episode_idx to its max_start_idx
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
@@ -118,11 +122,14 @@ def run(cfg: DictConfig):
     # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
     valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
+    print(len(valid_indices), "valid starting points found for evaluation.")
+
+    if len(valid_indices) < cfg.eval.num_eval:
+        raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+        len(valid_indices), size=cfg.eval.num_eval, replace=False
     )
 
     # sort increasingly to avoid issues with HDF5Dataset indexing
@@ -130,11 +137,9 @@ def run(cfg: DictConfig):
 
     print(random_episode_indices)
 
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
-
-    if len(eval_episodes) < cfg.eval.num_eval:
-        raise ValueError("Not enough episodes with sufficient length for evaluation.")
+    eval_rows = dataset.get_row_data(random_episode_indices)
+    eval_episodes = eval_rows[col_name]
+    eval_start_idx = eval_rows["step_idx"]
 
     world.set_policy(policy)
 
@@ -151,7 +156,7 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-    
+
     print(metrics)
 
     results_path = results_path / cfg.output.filename
